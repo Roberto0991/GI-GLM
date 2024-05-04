@@ -1,0 +1,146 @@
+library(broom)
+library(dplyr)
+library(Hmisc)
+library(insuranceData)
+library(purrr)
+library(ggplot2)
+
+#Return the gini score
+#model_input = the model object
+#df_input    = the dataframe which is used to score the model
+#actuals_input = the vector containing the actual scores for comparison
+gini_score <- function(model_input, df_input, actuals_input){
+  return(rcorr.cens(predict(model_input, newdata = df_input, type = "response"), actuals_input)[["Dxy"]])
+}
+#special case of the above which uses the fitted values from the model object for gini score
+gini_score_train <- function(model_input, actuals_input){
+  return(rcorr.cens(exp(fitted.values(model_input)),actuals_input)[["Dxy"]])
+}
+
+# import the data and move into a tibble
+library(insuranceData)
+data("SingaporeAuto")
+df <- as_tibble(SingaporeAuto)
+rm(SingaporeAuto)
+
+# SingaporeAuto Data Descriptions
+# http://instruction.bus.wisc.edu/jfrees/jfreesbooks/Regression%20Modeling/BookWebDec2010/DataDescriptions.pdf
+# 
+# SexInsured  Gender of insured, including male (M), female(F) and unspecified (U)
+# Female      =1 if female, =0 otherwise
+# VehicleType The type of vehicle being insured, such as automobile (A), truck (T), and motorcycle (M)
+# PC          =1 if private vehicle, =0 otherwise
+# Clm Count   Number of claims during the year
+# Exp weights Exposure weight or the fraction of the year that the policy is in effect
+# LNWEIGHT    Logarithm of exposure weight
+# NCD         No Claims Discount. This is based ont he previous accident record of the policyholder.
+#             The higher the discount, the better is the prior accident record.
+# AgeCat      The age of the policyholder, in years grouped into seven categories.
+#             0-6 indicate age groups 21 and younger, 22-25, 26-35, 36-45, 46-55, 56-65, 66 and over, respectively
+# VAgeCat     The age of the vehicle, in years, grouped into seven categories.
+#             0-6 indicate groups 0, 1, 2, 3-5, 6-10, 11-15, 16 and older, respectively
+# AutoAge0    =1 if private vehicle and VAgeCat = 0, =0 otherwise
+# AutoAge1    =1 if private vehicle and VAgeCat = 1, =0 otherwise
+# AutoAge2    =1 if private vehicle and VAgeCat = 2, =0 otherwise
+# AutoAge     =1 if Private vehicle and VAgeCat = 0, 1 or 2, =0 otherwise
+# VAgecat1    VAgeCat with categories 0, 1, and 2 combined
+
+# process and clean the data
+df_process <- df %>%
+  transmute(SexInsured=factor(SexInsured),
+            Female=factor(Female),
+            Private=factor(PC),
+            NCDCat=factor(NCD),
+            AgeCat=factor(AgeCat),
+            VAgeCat=factor(VAgeCat),
+            Exp_weights,
+            Clm_Count,
+            Frequency = Clm_Count/Exp_weights
+  )
+
+
+summary(df_process)
+
+
+#Define the base chart parameters
+g <- ggplot(data=df_process)+scale_y_continuous(labels = scales::percent)
+
+#Exposure histogram
+g+geom_histogram(aes_string(x="Exp_weights",y="..count../sum(..count..)"),binwidth=.005)+ggtitle("Exposure weights")+labs(x=NULL, y="% records")
+
+#Claims bar chart
+geom_claims <- g+geom_bar(aes_string(x="Clm_Count",y="..prop..",weight="Exp_weights/sum(Exp_weights)"))+ggtitle("Claim counts")+labs(x=NULL, y="% exposure")
+geom_claims
+
+#Facet the claims bar chart by NCD
+geom_claims+facet_grid(.~NCDCat)+ggtitle("Claim counts by NCDCat")
+
+## Building the model
+
+set.seed(12345) # reproducible random numbers
+df_sample_fraction <- 0.80
+df_training_rows <- sample(1:nrow(df_process), size = nrow(df_process) * df_sample_fraction, replace = FALSE)
+df_train <- df_process [df_training_rows,]
+df_validation <- df_process [-df_training_rows,]
+
+model_intercept <- glm(Clm_Count~1, family=poisson(link=log), data=df_train, offset=log(Exp_weights), y=FALSE, model=FALSE)
+tidy(model_intercept)
+
+paste("Check average model frequency",exp(model_intercept$coefficients[["(Intercept)"]]),"vs data average frequency",sum(df_train$Clm_Count)/sum(df_train$Exp_weights))
+
+glance(model_intercept)
+
+head(augment(model_intercept))
+
+model_full <- glm(Clm_Count~. - Frequency - Exp_weights, family=poisson(link=log), data=df_train, offset=log(Exp_weights), y=FALSE, model=FALSE)
+tidy(model_full)
+
+glance(model_full)
+
+model_stepwise <- step(model_intercept, scope=list(lower=model_intercept, upper=model_full), direction = "both")
+
+tidy(model_stepwise)
+
+glance(model_stepwise)
+
+#Declare model objects into a tibble
+model_table <- tibble(description = c("Intercept", "Full", "Stepwise"),
+                      model = list(model_intercept, model_full, model_stepwise))
+#Calculate validation statistics and objects
+model_table <- model_table %>%
+  mutate(Deviance_train  = model %>% map(glance) %>% map_dbl("deviance"),
+         AIC             = model %>% map(glance) %>% map_dbl("AIC"),
+         gini_train      = model %>% map_dbl(gini_score_train,                          actuals_input = df_train$Frequency),
+         gini_validation = model %>% map_dbl(gini_score      ,df_input = df_validation, actuals_input = df_validation$Frequency)
+  )
+model_table
+
+drop1(model_stepwise, test="Chisq")
+
+
+#Trimming https://win-vector.com/2014/05/30/trimming-the-fat-from-glm-models-in-r/
+stripGlmLR = function(cm) {
+  cm$y = c()
+  cm$model = c()
+  
+  cm$residuals = c()
+  cm$fitted.values = c()
+  cm$effects = c()
+  cm$qr$qr = c()  
+  cm$linear.predictors = c()
+  cm$weights = c()
+  cm$prior.weights = c()
+  cm$data = c()
+  
+  
+  cm$family$variance = c()
+  cm$family$dev.resids = c()
+  cm$family$aic = c()
+  cm$family$validmu = c()
+  cm$family$simulate = c()
+  attr(cm$terms,".Environment") = c()
+  attr(cm$formula,".Environment") = c()
+  
+  cm
+}
+model_stepwise <- stripGlmLR(model_stepwise)
